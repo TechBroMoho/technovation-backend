@@ -1,11 +1,9 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -13,62 +11,71 @@ from app.models.models import OAuthToken, User
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-SCOPES = [
+SCOPES = " ".join([
     "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
+    "email",
+    "profile",
     "https://www.googleapis.com/auth/calendar.readonly",
-]
+])
 
-
-def get_flow():
-    """Build the Google OAuth flow from environment variables."""
-    return Flow.from_client_config(
-        client_config={
-            "web": {
-                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
-                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        },
-        scopes=SCOPES,
-        redirect_uri=os.getenv("GOOGLE_REDIRECT_URI"),
-    )
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
 @router.get("/login")
 def login():
     """Step 1: Redirect the user to Google's OAuth consent screen."""
-    flow = get_flow()
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",   # Ensures we get a refresh token
-        prompt="consent",        # Forces Google to always return a refresh token
-    )
-    return RedirectResponse(auth_url)
+    params = {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI"),
+        "response_type": "code",
+        "scope": SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    query_string = "&".join(f"{k}={v}" for k, v in params.items())
+    return RedirectResponse(f"{GOOGLE_AUTH_URL}?{query_string}")
 
 
 @router.get("/callback")
 def oauth_callback(code: str, db: Session = Depends(get_db)):
     """
     Step 2: Google redirects here after the user logs in.
-    We exchange the code for tokens and store them in Postgres.
+    Exchange the code for tokens and store them in Postgres.
     """
-    flow = get_flow()
+    # Exchange authorization code for tokens
+    token_response = httpx.post(GOOGLE_TOKEN_URL, data={
+        "code": code,
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+        "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI"),
+        "grant_type": "authorization_code",
+    })
 
-    # Exchange the authorization code for access + refresh tokens
-    flow.fetch_token(code=code)
-    credentials = flow.credentials
+    if token_response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Token exchange failed: {token_response.text}")
 
-    # Use the access token to get the user's Google profile info
-    user_info_service = build("oauth2", "v2", credentials=credentials)
-    user_info = user_info_service.userinfo().get().execute()
+    tokens = token_response.json()
+    access_token = tokens["access_token"]
+    refresh_token = tokens.get("refresh_token")
+    expires_in = tokens.get("expires_in")
 
+    # Get user info from Google
+    userinfo_response = httpx.get(
+        GOOGLE_USERINFO_URL,
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+
+    if userinfo_response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to fetch user info from Google")
+
+    user_info = userinfo_response.json()
     google_id = user_info["id"]
     email = user_info["email"]
     name = user_info.get("name")
 
-    # Upsert the user (create if new, update if existing)
+    # Upsert user
     user = db.query(User).filter(User.google_id == google_id).first()
     if not user:
         user = User(google_id=google_id, email=email, name=name)
@@ -76,25 +83,23 @@ def oauth_callback(code: str, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
 
-    # Parse token expiry if available
+    # Calculate token expiry
     expiry = None
-    if credentials.expiry:
-        expiry = credentials.expiry.replace(tzinfo=timezone.utc)
+    if expires_in:
+        expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-    # Upsert the OAuth tokens for this user
+    # Upsert tokens
     token_record = db.query(OAuthToken).filter(OAuthToken.user_id == user.id).first()
     if token_record:
-        token_record.access_token = credentials.token
-        token_record.refresh_token = credentials.refresh_token or token_record.refresh_token
+        token_record.access_token = access_token
+        token_record.refresh_token = refresh_token or token_record.refresh_token
         token_record.token_expiry = expiry
-        token_record.scopes = " ".join(credentials.scopes or [])
     else:
         token_record = OAuthToken(
             user_id=user.id,
-            access_token=credentials.token,
-            refresh_token=credentials.refresh_token,
+            access_token=access_token,
+            refresh_token=refresh_token,
             token_expiry=expiry,
-            scopes=" ".join(credentials.scopes or []),
         )
         db.add(token_record)
 
